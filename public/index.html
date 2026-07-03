@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>x8music</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, sans-serif;
+    background: #0d0d0f;
+    color: #e8e8ea;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  header {
+    padding: 1rem;
+    border-bottom: 1px solid #222;
+    display: flex;
+    gap: 0.5rem;
+  }
+  input {
+    flex: 1;
+    padding: 0.6rem 0.8rem;
+    border-radius: 6px;
+    border: 1px solid #333;
+    background: #17171a;
+    color: inherit;
+    font-size: 1rem;
+  }
+  button {
+    padding: 0.6rem 1rem;
+    border-radius: 6px;
+    border: none;
+    background: #3a6ee8;
+    color: #fff;
+    font-size: 1rem;
+    cursor: pointer;
+  }
+  ul { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+  li {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 1rem;
+    cursor: pointer;
+    border-bottom: 1px solid #1a1a1d;
+  }
+  li:hover { background: #17171a; }
+  li.playing { background: #1c2a4a; }
+  li img { width: 40px; height: 40px; border-radius: 4px; object-fit: cover; background: #222; }
+  .meta { display: flex; flex-direction: column; overflow: hidden; }
+  .title { font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .artist { font-size: 0.8rem; color: #999; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  footer {
+    padding: 0.75rem 1rem;
+    border-top: 1px solid #222;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  #nowPlaying { font-size: 0.9rem; color: #aaa; min-height: 1.1em; }
+  audio { width: 100%; }
+  .status { padding: 1rem; color: #888; }
+</style>
+</head>
+<body>
+<header>
+  <input id="q" type="text" placeholder="Search tracks..." autofocus>
+  <button id="searchBtn">Search</button>
+</header>
+<ul id="results"></ul>
+<footer>
+  <div id="nowPlaying"></div>
+  <audio id="player" controls></audio>
+</footer>
+<script>
+const q = document.getElementById('q');
+const results = document.getElementById('results');
+const player = document.getElementById('player');
+const nowPlaying = document.getElementById('nowPlaying');
+
+async function search() {
+  const query = q.value.trim();
+  if (!query) return;
+  results.innerHTML = '<div class="status">Searching…</div>';
+  try {
+    const res = await fetch('/api/music/search?q=' + encodeURIComponent(query));
+    const data = await res.json();
+    renderResults(data.items || []);
+  } catch (e) {
+    results.innerHTML = '<div class="status">Search failed.</div>';
+  }
+}
+
+function renderResults(tracks) {
+  results.innerHTML = '';
+  if (!tracks.length) {
+    results.innerHTML = '<div class="status">No results.</div>';
+    return;
+  }
+  for (const t of tracks) {
+    const li = document.createElement('li');
+    li.innerHTML = `
+      <img src="${t.artwork || ''}" alt="">
+      <div class="meta">
+        <div class="title">${escapeHtml(t.title)}</div>
+        <div class="artist">${escapeHtml(t.artist)}</div>
+      </div>
+    `;
+    li.addEventListener('click', () => play(t, li));
+    results.appendChild(li);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function play(track, li) {
+  document.querySelectorAll('#results li.playing').forEach((el) => el.classList.remove('playing'));
+  li.classList.add('playing');
+  nowPlaying.textContent = `${track.title} — ${track.artist}`;
+
+  const params = new URLSearchParams({ id: String(track.id) });
+  if (track.isrc) params.set('isrc', track.isrc);
+  if (track.source) params.set('source', track.source);
+  if (track.title) params.set('title', track.title);
+  if (track.artist) params.set('artist', track.artist);
+
+  player.src = '/api/music/stream?' + params.toString();
+  player.play().catch(() => {});
+}
+
+document.getElementById('searchBtn').addEventListener('click', search);
+q.addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
+</script>
+</body>
+</html>
