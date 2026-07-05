@@ -1,5 +1,5 @@
 # x8rr/music
-a simple music implementation in react and fastify
+a simple music implementation in fastify
 
 ## sources
 - deezer (best source)
