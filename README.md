@@ -1,3 +1,7 @@
+this repo is broken right now, a fix is coming soon!
+
+---
+
 # x8rr/music
 a simple music implementation in fastify
 
