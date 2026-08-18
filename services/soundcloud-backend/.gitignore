@@ -1,0 +1,4 @@
+node_modules/
+# The yt-dlp binary is fetched per-deployment, not committed — it's ~3MB and
+# goes stale fast (SoundCloud/YouTube extractors change constantly).
+yt-dlp

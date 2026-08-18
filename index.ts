@@ -4,6 +4,7 @@ import staticPlugin from "@fastify/static";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { musicRoutes } from "./routes/music";
+import { youtubeRoutes } from "./routes/youtube";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const fastify = Fastify({ logger: { level: "info" } });
@@ -14,6 +15,7 @@ async function startServer() {
     root: path.join(__dirname, "public"),
   });
   fastify.register(musicRoutes);
+  fastify.register(youtubeRoutes);
 
   fastify.setNotFoundHandler((req, res) => {
     res

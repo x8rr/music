@@ -1,61 +1,104 @@
 import { FastifyInstance, FastifyReply } from "fastify";
 import { Readable } from "node:stream";
+import { promises as fsp, constants as fsConstants } from "node:fs";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { tidalSearchTracks } from "../lib/tidal";
+import {
+  resolveMonochromeStream,
+  isAuthed as monochromeIsAuthed,
+  authState as monochromeAuthState,
+  exchangeTurnstile as monochromeExchangeTurnstile,
+  getConfig as monochromeGetConfig,
+  AUTH_PAGE_HTML as MONOCHROME_AUTH_PAGE,
+} from "../lib/monochromeTrack";
+import musicSources from "../config/music-sources.json";
+import {
+  buildOctaveStreamUrl,
+  getOctaveToken,
+  invalidateOctaveToken,
+  octaveScriptPath,
+  octaveStatus,
+  refreshOctaveToken,
+  resolveOctaveTrackId,
+} from "../lib/octave";
 
-const MUSIC_API_BASES = (
-  process.env.MUSIC_API_BASES ||
-  "https://hifi.geeked.wtf,https://eu-central.monochrome.tf,https://us-west.monochrome.tf,https://api.monochrome.tf,https://maus.qqdl.site,https://vogel.qqdl.site,https://katze.qqdl.site,https://hund.qqdl.site,https://monochrome-api.samidy.com,https://tidal.kinoplus.online,https://wolf.qqdl.site"
-)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+/**
+ * Release a response we're not going to read.
+ *
+ * An un-consumed `Response` body keeps its socket and the buffers behind it
+ * alive until GC gets around to it. On the happy path that never matters,
+ * because the success branch reads the body via .json()/.text(). It matters a
+ * great deal on error paths: when the upstreams are unhealthy, every play
+ * cascades through five providers and each failed leg abandons a live body.
+ * That is a slow OOM that only shows up when something else is already broken.
+ */
+function discard(res: { body?: { cancel(): Promise<void> } | null }): void {
+  res.body?.cancel().catch(() => {});
+}
 
-const MUSIC_STREAM_BASES = (
-  process.env.MUSIC_STREAM_BASES ||
-  "https://hifi.geeked.wtf,https://maus.qqdl.site,https://vogel.qqdl.site,https://katze.qqdl.site,https://hund.qqdl.site,https://wolf.qqdl.site"
-)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+// Instance lists live in music-sources.json — edit that file to add/remove/
+// reorder mirrors (first entry wins) without touching code. An env var with
+// the same name still overrides the whole list (comma-separated) if set, for
+// per-deployment tweaks without editing the checked-in file.
+function sourceBases(envVar: string, fallback: string[]): string[] {
+  const raw = process.env[envVar];
+  if (!raw) return fallback;
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+const MUSIC_API_BASES = sourceBases(
+  "MUSIC_API_BASES",
+  musicSources.musicApiBases,
+);
+const MUSIC_STREAM_BASES = sourceBases(
+  "MUSIC_STREAM_BASES",
+  musicSources.musicStreamBases,
+);
+const QOBUZ_BASES = sourceBases("QOBUZ_API_BASES", musicSources.qobuzBases);
+const DEEZER_BASES = sourceBases("DEEZER_API_BASES", musicSources.deezerBases);
+// The standalone yt-dlp-backed SoundCloud service (soundcloud-backend/). It
+// reaches SoundCloud through yt-dlp rather than the api-v2 client_id flow, so
+// it keeps working when the scraped client_id is dead or rate-limited — which
+// is the whole reason it exists as a separate fallback from "soundcloud".
+const SCDLP_BASES = sourceBases("SC_DLP_BASES", musicSources.scdlpBases);
 
 const AUDIO_PROXY_BASE =
   process.env.AUDIO_PROXY_BASE || "https://audio-proxy.binimum.org/proxy-audio";
 
+// The audio proxy is a third party we can't renew certs for, and its cert has
+// lapsed before. A browser can't be told to ignore that — the click-through
+// interstitial only exists for top-level navigations, so subresource fetches
+// just fail — which takes every Tidal/Qobuz stream down while YouTube (which
+// doesn't route through it) keeps working.
+//
+// So we relay segments through /api/music/segment instead of pointing the
+// player straight at the proxy: fetched here, re-served over our own cert.
+// Verification is ON unless someone explicitly opts out with
+// AUDIO_PROXY_INSECURE=1, so a fresh deploy is safe by default and accepting a
+// bad cert is a deliberate act rather than something you inherit.
+//
+// This relay is only reached for Tidal DASH playback, and Tidal currently
+// resolves to 30-second previews that assertPlayable rejects — so nothing hits
+// this path today and the strict default costs no functionality. If the Tidal
+// mirrors come back and the proxy's cert is still expired, that is the moment
+// to weigh setting this, knowing an attacker in between could substitute audio.
+const AUDIO_PROXY_INSECURE = process.env.AUDIO_PROXY_INSECURE === "1";
+
+const SEGMENT_PREFIX = "/api/music/segment/";
+
 const MUSIC_TIMEOUT_MS = 4000;
 
-const QOBUZ_BASES = (
-  process.env.QOBUZ_API_BASES ||
-  "https://qdl-api.monochrome.tf,https://qobuz.kennyy.com.br,https://mono.scavengerfurs.net"
-)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// Deezer ISRC fallback (ported from Monochrome). A lossless (FLAC) source that
-// slots between Qobuz and the lossy SoundCloud/YouTube fallbacks. The /stream/
-// endpoint returns the audio directly, keyed by ISRC.
-const DEEZER_BASES = (
-  process.env.DEEZER_API_BASES || "https://dzr.tabs-vs-spaces.wtf"
-)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// Public Deezer instances gate on an allowed Origin, so every request to one
-// (resolve + the proxied stream fetch) must present an allowlisted origin.
 const DEEZER_ORIGIN = process.env.DEEZER_ORIGIN || "https://monochrome.tf";
 
-// Warm tracks probe in ~200ms and misses 404 in ~250ms, so a short timeout is
-// enough to classify. A stall means a cold track (warm-up can take 90s+) — we
-// hand back the URL and let the stream proxy wait it out instead of failing.
 const DEEZER_TIMEOUT_MS = Number(process.env.DEEZER_TIMEOUT_MS) || 4000;
 
 function isDeezerUrl(url: string): boolean {
   return DEEZER_BASES.some((b) => url.startsWith(b.replace(/\/+$/, "")));
 }
 
-/** Add the Deezer origin headers when fetching a Deezer URL; otherwise pass through. */
 function streamFetchHeaders(
   url: string,
   base: Record<string, string> = {},
@@ -113,7 +156,7 @@ interface ClientTrack {
   explicit?: boolean;
   isrc?: string;
   isDash?: boolean;
-  source?: "tidal" | "soundcloud" | "qobuz" | "youtube";
+  source?: SourcePriority;
   permalinkUrl?: string;
 }
 
@@ -216,11 +259,55 @@ interface QobuzDownloadResp {
   };
 }
 
-type SourcePriority = "tidal" | "qobuz" | "deezer" | "soundcloud" | "youtube";
+type SourcePriority =
+  | "tidal"
+  | "octave"
+  | "monochrome"
+  | "qobuz"
+  | "scdlp"
+  | "deezer"
+  | "soundcloud"
+  | "youtube";
+
+/** Sources that resolve a stream but have no search endpoint of their own —
+ * they can only answer "give me audio for this title/artist/ISRC". They're
+ * excluded from search ordering and from the health ping. */
+const STREAM_ONLY_SOURCES: ReadonlySet<SourcePriority> = new Set([
+  "octave",
+  "deezer",
+  "monochrome",
+]);
+
+/** Canonical source order. Streaming races all of these at once and plays
+ * whichever resolves first, so this order only decides search fallback and
+ * ties in the UI — but it is the one place the intended ranking is written
+ * down, so keep it in sync with the picker in Music.tsx. */
+const SOURCE_ORDER: SourcePriority[] = [
+  "tidal",
+  "octave",
+  "monochrome",
+  "qobuz",
+  "scdlp",
+  "deezer",
+  "soundcloud",
+  "youtube",
+];
 
 let currentSourcePriority: SourcePriority = "tidal";
 const sourceLatencies: Map<SourcePriority, number> = new Map();
 let lastPingTime = 0;
+
+/* Stream proxy instrumentation, read by /api/system/memory.
+ *
+ * `open` is the number of upstream audio streams currently being piped. If it
+ * climbs and never comes back down, streams are not being torn down when the
+ * client goes away — which is exactly the shape of a native memory leak that
+ * the JS heap cannot see, because the buffered audio lives in the stream
+ * plumbing rather than in any JS object we hold. */
+const streamProxy = { open: 0, started: 0, finished: 0 };
+export function musicStats() {
+  return { ...streamProxy };
+}
 const PING_INTERVAL = 300000;
 
 let cachedClientId: string | null = null;
@@ -239,9 +326,9 @@ function tidalArtistPictureUrl(
   return `https://resources.tidal.com/images/${picture.replace(/-/g, "/")}/${size}x${size}.jpg`;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function toClientAlbum(a: any): ClientAlbum {
-  const artist = a.artist || (Array.isArray(a.artists) ? a.artists[0] : null) || {};
+  const artist =
+    a.artist || (Array.isArray(a.artists) ? a.artists[0] : null) || {};
   return {
     id: a.id,
     title: a.title || "Unknown Album",
@@ -253,7 +340,6 @@ function toClientAlbum(a: any): ClientAlbum {
   };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function toClientArtist(a: any): ClientArtist {
   return {
     id: a.id,
@@ -262,23 +348,17 @@ function toClientArtist(a: any): ClientArtist {
   };
 }
 
-// Extract a named section (tracks/albums/artists) from a Tidal search response.
-// The proxy wraps responses as { version, data: { tracks: { items }, albums: { items }, ... } }
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractSearchSection(data: any, key: string): any[] {
   if (!data || typeof data !== "object") return [];
 
-  // Unwrap { version, data: {...} }
   if (data.data && typeof data.data === "object") {
     return extractSearchSection(data.data, key);
   }
 
-  // Section with items array: data[key].items
   if (data[key] && Array.isArray((data[key] as any).items)) {
     return (data[key] as any).items;
   }
 
-  // Flat items array at root (e.g. ?s= scoped track search)
   if (key === "tracks" && Array.isArray(data.items)) return data.items;
 
   return [];
@@ -299,10 +379,25 @@ function musicError(
   return reply.send({ error: message, ...extra });
 }
 
+// Octave signs its stream URLs with a shared server-side token. The client
+// never plays an octave URL directly — it always goes through the /api/music
+// stream proxy — so redact it from any JSON we do hand back.
+function redactOctaveToken(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.searchParams.has("k")) {
+      u.searchParams.set("k", "redacted");
+      return u.toString();
+    }
+  } catch {
+    // Not a URL; leave it alone.
+  }
+  return url;
+}
+
 const SC_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-// client_ids are mixed-case alphanumeric (~32 chars), not lowercase hex — the
-// old /[a-f0-9]+/ regex silently failed to match real ids and 500'd.
+
 const SC_CLIENT_ID_RE = /client_id\s*[:=]\s*\\?"?([a-zA-Z0-9]{20,})/;
 
 async function scFetchText(url: string): Promise<string> {
@@ -330,8 +425,6 @@ async function getSoundcloudClientId(): Promise<string> {
   try {
     const html = await scFetchText("https://soundcloud.com/");
 
-    // Every JS bundle the homepage references; the client_id lives in one of
-    // the later bundles, so scan from the end.
     const assetUrls = [
       ...html.matchAll(
         /src="(https:\/\/a-v2\.(?:sndcdn|soundcloud)\.com\/assets\/[^"]+\.js)"/g,
@@ -426,7 +519,8 @@ function toSoundcloudClientTrack(track: SoundcloudTrack): ClientTrack {
 }
 
 function toClientTrack(t: TidalTrack): ClientTrack {
-  const primaryArtist = t.artists && t.artists.length > 0 ? t.artists[0] : t.artist;
+  const primaryArtist =
+    t.artists && t.artists.length > 0 ? t.artists[0] : t.artist;
   const artist =
     (t.artists && t.artists.length > 0
       ? t.artists.map((a) => a.name).join(", ")
@@ -472,7 +566,10 @@ async function callMusicApi<T>(
         },
       });
       clearTimeout(t);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) {
+        discard(r);
+        throw new Error(`HTTP ${r.status}`);
+      }
       return (await r.json()) as T;
     } catch (e) {
       clearTimeout(t);
@@ -480,7 +577,6 @@ async function callMusicApi<T>(
     }
   };
 
-  // Race all bases in parallel — return first success, ignore others
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     let remaining = bases.length;
@@ -495,10 +591,14 @@ async function callMusicApi<T>(
           }
         },
         (err) => {
-          errors.push(`${base}: ${err instanceof Error ? err.message : String(err)}`);
+          errors.push(
+            `${base}: ${err instanceof Error ? err.message : String(err)}`,
+          );
           remaining--;
           if (remaining === 0 && !settled) {
-            reject(new Error(`All music upstreams failed: ${errors.join(" | ")}`));
+            reject(
+              new Error(`All music upstreams failed: ${errors.join(" | ")}`),
+            );
           }
         },
       );
@@ -520,24 +620,25 @@ async function qobuzSearch(
       );
       clearTimeout(t);
 
-      if (!res.ok) continue;
+      if (!res.ok) {
+        discard(res);
+        continue;
+      }
 
       const data = (await res.json()) as QobuzSearchResp;
 
       const items = data?.data?.tracks?.items || [];
-      return items.map(
-        (t): ClientTrack => ({
-          id: t.id,
-          title: t.title,
-          artist: t.artist?.name || t.artists?.[0]?.name || "Unknown",
-          album: t.album?.title,
-          artwork: t.album?.cover || "",
-          duration: t.duration,
-          explicit: t.explicit || false,
-          isrc: t.isrc,
-          source: "qobuz",
-        }),
-      );
+      return items.map((t): ClientTrack => ({
+        id: t.id,
+        title: t.title,
+        artist: t.artist?.name || t.artists?.[0]?.name || "Unknown",
+        album: t.album?.title,
+        artwork: t.album?.cover || "",
+        duration: t.duration,
+        explicit: t.explicit || false,
+        isrc: t.isrc,
+        source: "qobuz",
+      }));
     } catch {
       continue;
     }
@@ -609,9 +710,59 @@ async function resolveQobuzStreamUrl(isrc: string): Promise<{ url: string }> {
   throw new Error(`All Qobuz upstreams failed: ${summary}`);
 }
 
+// Health probes run under Promise.all, so one hanging upstream stalls the whole
+// ping — and /api/music/source and /api/music/ping along with it. A dead mirror
+// that accepts the connection and never answers (qobuz.kennyy.com.br does
+// exactly this) would otherwise hold the request open indefinitely.
+const PING_REQUEST_TIMEOUT_MS = 3000;
+const PING_TOTAL_TIMEOUT_MS = 8000;
+
+/** A bounded fetch for probes. */
+async function pingFetch(
+  url: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PING_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Caps a probe that can't be given an abort signal — tidalSearchTracks and
+ * yt-search both wrap their own transports. The underlying work may keep
+ * running, but the ping stops waiting on it. */
+function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`${label} ping exceeded ${ms}ms`)),
+        ms,
+      );
+    }),
+  ]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
 async function testSourceLatency(source: SourcePriority): Promise<number> {
   const start = Date.now();
   try {
+    await withDeadline(probeSource(source), PING_TOTAL_TIMEOUT_MS, source);
+    const latency = Date.now() - start;
+    sourceLatencies.set(source, latency);
+    return latency;
+  } catch (err) {
+    console.log(`${source} ping failed:`, err);
+    sourceLatencies.set(source, Infinity);
+    return Infinity;
+  }
+}
+
+async function probeSource(source: SourcePriority): Promise<void> {
+  {
     switch (source) {
       case "tidal": {
         await tidalSearchTracks("test", 1);
@@ -621,7 +772,7 @@ async function testSourceLatency(source: SourcePriority): Promise<number> {
         let success = false;
         for (const base of QOBUZ_BASES) {
           try {
-            const res = await fetch(
+            const res = await pingFetch(
               `${base}/api/get-music?q=test&offset=0&limit=1`,
             );
             if (res.ok) {
@@ -641,13 +792,40 @@ async function testSourceLatency(source: SourcePriority): Promise<number> {
         url.searchParams.set("client_id", clientId);
         url.searchParams.set("q", "test");
         url.searchParams.set("limit", "1");
-        const res = await fetch(url.toString(), {
+        const res = await pingFetch(url.toString(), {
           headers: {
             "User-Agent": "Mozilla/5.0",
             Accept: "application/json",
           },
         });
-        if (!res.ok) throw new Error(`SoundCloud HTTP ${res.status}`);
+        if (!res.ok) {
+          discard(res);
+          throw new Error(`SoundCloud HTTP ${res.status}`);
+        }
+        break;
+      }
+      case "scdlp": {
+        if (SCDLP_BASES.length === 0) throw new Error("No scdlp base");
+        let success = false;
+        for (const base of SCDLP_BASES) {
+          try {
+            const res = await pingFetch(
+              `${base.replace(/\/+$/, "")}/api/music/status`,
+            );
+            if (!res.ok) {
+              discard(res);
+              continue;
+            }
+            const data = (await res.json()) as { ok?: boolean };
+            if (data.ok) {
+              success = true;
+              break;
+            }
+          } catch {
+            continue;
+          }
+        }
+        if (!success) throw new Error("No scdlp base responded");
         break;
       }
       case "youtube": {
@@ -656,13 +834,6 @@ async function testSourceLatency(source: SourcePriority): Promise<number> {
         break;
       }
     }
-    const latency = Date.now() - start;
-    sourceLatencies.set(source, latency);
-    return latency;
-  } catch (err) {
-    console.log(`${source} ping failed:`, err);
-    sourceLatencies.set(source, Infinity);
-    return Infinity;
   }
 }
 
@@ -673,7 +844,9 @@ function schedulePing() {
   if (pingInFlight) return;
   if (now - lastPingTime < PING_INTERVAL && sourceLatencies.size > 0) return;
   pingInFlight = true;
-  pingAllSources().finally(() => { pingInFlight = false; });
+  pingAllSources().finally(() => {
+    pingInFlight = false;
+  });
 }
 
 async function pingAllSources() {
@@ -687,35 +860,22 @@ async function pingAllSources() {
     sourceLatencies.set("soundcloud", Infinity);
   }
 
-  const results = await Promise.all([
-    testSourceLatency("tidal"),
-    testSourceLatency("qobuz"),
-    testSourceLatency("soundcloud"),
-    testSourceLatency("youtube"),
-  ]);
+  const pinged = SOURCE_ORDER.filter((s) => !STREAM_ONLY_SOURCES.has(s));
+  const results = await Promise.all(pinged.map(testSourceLatency));
 
   const workingSources: SourcePriority[] = [];
   const sourceLatencyMap: Record<string, number> = {};
 
   results.forEach((lat, idx) => {
-    const source = ["tidal", "qobuz", "soundcloud", "youtube"][
-      idx
-    ] as SourcePriority;
+    const source = pinged[idx];
     sourceLatencyMap[source] = lat;
     if (lat !== Infinity) {
       workingSources.push(source);
     }
   });
 
-  if (workingSources.includes("tidal")) {
-    currentSourcePriority = "tidal";
-  } else if (workingSources.includes("qobuz")) {
-    currentSourcePriority = "qobuz";
-  } else if (workingSources.includes("soundcloud")) {
-    currentSourcePriority = "soundcloud";
-  } else if (workingSources.includes("youtube")) {
-    currentSourcePriority = "youtube";
-  }
+  const preferred = pinged.find((s) => workingSources.includes(s));
+  if (preferred) currentSourcePriority = preferred;
 
   console.log(
     `[SourcePing] Current: ${currentSourcePriority}, Latencies:`,
@@ -732,13 +892,11 @@ async function searchWithPriority(
 
   const sourceToUse = requestedSource || currentSourcePriority;
 
-  const fallbackOrder: SourcePriority[] = [
-    "tidal",
-    "qobuz",
-    "soundcloud",
-    "youtube",
-  ];
-  const startIndex = fallbackOrder.indexOf(sourceToUse);
+  // Deezer resolves streams by ISRC only — it has no search of its own.
+  const fallbackOrder: SourcePriority[] = SOURCE_ORDER.filter(
+    (s) => !STREAM_ONLY_SOURCES.has(s),
+  );
+  const startIndex = Math.max(0, fallbackOrder.indexOf(sourceToUse));
   const orderedSources = [
     ...fallbackOrder.slice(startIndex),
     ...fallbackOrder.slice(0, startIndex),
@@ -771,21 +929,10 @@ async function searchWithPriority(
           },
         );
         results = (data?.collection || []).map(toSoundcloudClientTrack);
+      } else if (source === "scdlp") {
+        results = await scdlpSearch(query, limit);
       } else if (source === "youtube") {
-        const { default: yts } = await import("yt-search");
-        const ytResults = await (yts as any)(query);
-        const videos = (ytResults?.videos || []).slice(0, limit);
-        results = videos.map((v: any) => ({
-          id: v.videoId,
-          title: v.title,
-          artist: v.author?.name || "Unknown",
-          album: undefined,
-          artwork: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-          duration: v.duration?.seconds || 0,
-          explicit: false,
-          source: "youtube" as const,
-          permalinkUrl: `https://youtube.com/watch?v=${v.videoId}`,
-        }));
+        results = await ytSearchAccurate(query, limit);
       }
 
       if (results.length > 0) {
@@ -811,9 +958,11 @@ interface StreamResult {
 interface StreamMeta {
   title?: string;
   artist?: string;
+  /** Real track length in seconds, from search results. Lets us recognise a
+   * 30-second preview as a failure rather than a stream. */
+  duration?: number;
 }
 
-/** Resolve a playable stream from a single source (throws if that source can't serve it). */
 async function resolveFromSource(
   source: SourcePriority,
   id: string,
@@ -821,6 +970,7 @@ async function resolveFromSource(
   quality: string | undefined,
   sourceHint: SourcePriority | undefined,
   meta: StreamMeta | undefined,
+  octaveToken?: string,
 ): Promise<StreamResult> {
   if (source === "tidal") {
     const r = await resolveTidalStreamUrl(id, quality ?? "HIGH");
@@ -832,10 +982,46 @@ async function resolveFromSource(
       isDash: r.isDash,
     };
   }
+  if (source === "octave") {
+    // Kept as-is: octave still only races for Tidal-sourced tracks, or when the
+    // user picked "Octave" in the UI. Failing fast prevents it from burning a
+    // (slow) browser launch to fetch a token it won't get to use.
+    if (sourceHint !== "tidal" && sourceHint !== "octave")
+      throw new Error("Octave is only raced for Tidal-sourced tracks");
+    const token = octaveToken || (await getOctaveToken());
+    if (!token) throw new Error("No Octave playback token");
+    // `id` is Tidal's, and Octave's id space is unrelated to it — passing it
+    // straight through made /audio/320 spend ~15s looking for a track that
+    // isn't there and then 503, on every single play. Resolve a real octave id
+    // by title/artist/duration first; a miss falls through to another source.
+    const octaveId = await resolveOctaveTrackId(
+      { title: meta?.title, artist: meta?.artist, duration: meta?.duration },
+      token,
+    );
+    if (!octaveId) throw new Error("No Octave match for this track");
+    return {
+      url: buildOctaveStreamUrl(octaveId, token),
+      mimeType: "audio/mpeg",
+      source: "octave",
+    };
+  }
   if (source === "qobuz") {
     if (!isrc) throw new Error("No ISRC for Qobuz lookup");
     const r = await resolveQobuzStreamUrl(isrc);
     return { url: r.url, mimeType: "audio/flac", source: "qobuz" };
+  }
+  if (source === "monochrome") {
+    const r = await resolveMonochromeStream({
+      title: meta?.title,
+      artist: meta?.artist,
+      isrc,
+      duration: meta?.duration,
+    });
+    return { url: r.url, mimeType: "audio/flac", source: "monochrome" };
+  }
+  if (source === "scdlp") {
+    const r = await resolveScDlpStreamUrl(id, sourceHint, meta);
+    return { url: r.url, mimeType: r.mimeType, source: "scdlp" };
   }
   if (source === "deezer") {
     if (!isrc) throw new Error("No ISRC for Deezer lookup");
@@ -843,17 +1029,21 @@ async function resolveFromSource(
     return { url: r.url, mimeType: r.mimeType, source: "deezer" };
   }
   if (source === "soundcloud") {
-    // If the id is a Tidal/Qobuz id (or we have better meta), search SC by name.
     const numId = parseInt(id);
     let scTrackId: number;
     if (sourceHint !== "soundcloud" && meta?.artist && meta?.title) {
-      const scResults = await soundcloudApiRequest<SoundcloudSearchResp>("/tracks", {
-        q: `${meta.artist} ${meta.title}`,
-        limit: 5,
-      });
+      const scResults = await soundcloudApiRequest<SoundcloudSearchResp>(
+        "/tracks",
+        {
+          q: `${meta.artist} ${meta.title}`,
+          limit: 5,
+        },
+      );
       const match =
         scResults.collection?.find((t) =>
-          t.title.toLowerCase().includes(meta.title!.toLowerCase().split("(")[0].trim()),
+          t.title
+            .toLowerCase()
+            .includes(meta.title!.toLowerCase().split("(")[0].trim()),
         ) || scResults.collection?.[0];
       if (!match) throw new Error("No SoundCloud results for this track");
       scTrackId = match.id;
@@ -865,87 +1055,299 @@ async function resolveFromSource(
     const r = await resolveSoundcloudStreamUrl(scTrackId);
     return { url: r.url, mimeType: r.mimeType, source: "soundcloud" };
   }
-  // youtube — search by title+artist if this isn't a native YT id.
+
   if (meta?.artist && meta?.title) {
-    const { default: yts } = await import("yt-search");
-    const ytResults = await (yts as any)(`${meta.artist} ${meta.title} audio`);
-    const video = ytResults?.videos?.[0];
-    if (!video?.videoId) throw new Error("No YouTube results");
-    const r = await resolveYoutubeStreamUrl(video.videoId);
+    const picked = await pickYoutubeMatch(meta.artist, meta.title);
+    if (!picked) throw new Error("No YouTube match");
+    const r = await resolveYoutubeStreamUrl(picked);
     return { url: r.url, mimeType: r.mimeType, source: "youtube" };
   }
   const r = await resolveYoutubeStreamUrl(id);
   return { url: r.url, mimeType: r.mimeType, source: "youtube" };
 }
 
-/**
- * Resolve a stream, preferring quality but optimizing for reliability: try the
- * hinted source first, then race the remaining lossless sources in parallel,
- * then the lossy ones. Racing means one dead/slow source can't serialize-block
- * the others — the first source that actually works wins.
- */
+// YouTube's default search sorts by algorithmic relevance and freely mixes in
+// covers, reactions, sped-up remixes, and hour-long compilations. When we're
+// using YouTube as an audio fallback for a specific known song we don't want
+// any of that. Pick the video that best matches the requested artist+title.
+const YT_JUNK_TERMS = [
+  "reaction",
+  "review",
+  "cover ",
+  " cover",
+  "sped up",
+  "slowed",
+  "nightcore",
+  "8d audio",
+  "1 hour",
+  "one hour",
+  "10 hour",
+  "loop",
+  "mashup",
+  "karaoke",
+  "instrumental",
+];
+
+interface YtVideoLike {
+  videoId: string;
+  title: string;
+  author?: { name?: string };
+  duration?: { seconds?: number };
+  views?: number;
+}
+
+function scoreYtVideo(
+  v: YtVideoLike,
+  wantArtist: string,
+  wantTitle: string,
+  wantDurationSec: number | null,
+): number {
+  const title = (v.title || "").toLowerCase();
+  const author = (v.author?.name || "").toLowerCase();
+  const artist = wantArtist.toLowerCase();
+  const song = wantTitle.toLowerCase();
+
+  if (YT_JUNK_TERMS.some((k) => title.includes(k))) return -Infinity;
+
+  let s = 0;
+  // Title must contain the song name; strongly preferred that the artist
+  // shows up somewhere too (title or channel).
+  if (title.includes(song)) s += 40;
+  if (author.includes(artist)) s += 30;
+  else if (title.includes(artist)) s += 15;
+
+  // "Topic" channels and channels with "VEVO" / "Official" in the name are
+  // usually the label's own uploads — highest-quality masters.
+  if (/ - topic$/.test(author)) s += 25;
+  if (/(vevo|official)/i.test(v.author?.name || "")) s += 20;
+  if (/(official (audio|music video|video|lyric)|audio only)/i.test(v.title || ""))
+    s += 15;
+
+  // Match duration within ±5s when we know it (Tidal/Qobuz always give us
+  // one). Anything wildly off is almost certainly the wrong upload.
+  if (wantDurationSec && v.duration?.seconds) {
+    const diff = Math.abs(v.duration.seconds - wantDurationSec);
+    if (diff <= 3) s += 30;
+    else if (diff <= 8) s += 15;
+    else if (diff > 30) s -= 40;
+    if (v.duration.seconds > 15 * 60) s -= 80; // hour-long uploads
+  }
+
+  return s;
+}
+
+async function ytSearchAccurate(
+  query: string,
+  limit: number,
+): Promise<ClientTrack[]> {
+  const { default: yts } = await import("yt-search");
+  const raw = (await (yts as unknown as (q: string) => Promise<{
+    videos?: YtVideoLike[];
+  }>)(query)).videos ?? [];
+  const filtered = raw.filter(
+    (v) =>
+      v.videoId &&
+      !YT_JUNK_TERMS.some((k) => (v.title || "").toLowerCase().includes(k)),
+  );
+  return filtered.slice(0, limit).map((v) => ({
+    id: v.videoId,
+    title: v.title,
+    artist: v.author?.name || "Unknown",
+    album: undefined,
+    artwork: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+    duration: v.duration?.seconds || 0,
+    explicit: false,
+    source: "youtube" as const,
+    permalinkUrl: `https://youtube.com/watch?v=${v.videoId}`,
+  }));
+}
+
+async function pickYoutubeMatch(
+  artist: string,
+  title: string,
+  durationSec: number | null = null,
+): Promise<string | null> {
+  const { default: yts } = await import("yt-search");
+  // "Topic" auto-uploads are indexed under the plain "artist - title" query;
+  // adding "audio" nudges results toward the label's own upload if there is
+  // no Topic channel.
+  const q = `${artist} ${title} audio`;
+  const raw = (await (yts as unknown as (q: string) => Promise<{
+    videos?: YtVideoLike[];
+  }>)(q)).videos ?? [];
+  const scored = raw
+    .map((v) => ({ v, s: scoreYtVideo(v, artist, title, durationSec) }))
+    .filter((x) => x.s > 0)
+    .sort((a, b) => b.s - a.s);
+  return scored[0]?.v.videoId ?? null;
+}
+
+// ISO 8601 duration as used by DASH: PT29.907S, PT3M42.5S, PT1H2M3S.
+function parseIsoDuration(v: string): number | null {
+  const m = /^PT(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?$/.exec(v.trim());
+  if (!m) return null;
+  const [, h, min, s] = m;
+  const total =
+    (h ? parseFloat(h) * 3600 : 0) +
+    (min ? parseFloat(min) * 60 : 0) +
+    (s ? parseFloat(s) : 0);
+  return Number.isFinite(total) && total > 0 ? total : null;
+}
+
+// A source can hand back something that resolves fine and still won't play:
+// Tidal serves a 30-second preview when the session isn't entitled to the
+// track, and any upstream can go down between resolving and streaming. Both
+// used to count as success, so the chain stopped at the first source that
+// answered and the player was left spinning on a stream that never arrived.
+// Verifying here is what lets a bad source fall through to the next one.
+const PLAYABILITY_TIMEOUT_MS = 6000;
+
+// The yt-dlp backend downloads the whole track before it serves a byte, so its
+// first request for a given track takes as long as the download does. Probing
+// it on the 6s budget would reject it every time on a cold cache and accept it
+// instantly afterwards; give it a window wide enough to actually finish.
+const SCDLP_PLAYABILITY_TIMEOUT_MS =
+  Number(process.env.SC_DLP_PLAYABILITY_TIMEOUT_MS) || 25000;
+
+async function assertPlayable(
+  result: StreamResult,
+  meta?: StreamMeta,
+): Promise<void> {
+  if (result.rawDash) {
+    const declared = /mediaPresentationDuration="([^"]+)"/.exec(result.rawDash);
+    const seconds = declared ? parseIsoDuration(declared[1]) : null;
+    // Only call it a preview when we know the real length and the manifest is
+    // dramatically shorter, so genuinely short tracks aren't rejected.
+    if (seconds !== null && meta?.duration && meta.duration > 60) {
+      if (seconds < meta.duration * 0.5) {
+        throw new Error(
+          `preview only (${Math.round(seconds)}s of ${Math.round(meta.duration)}s)`,
+        );
+      }
+    }
+    return;
+  }
+
+  // Direct URL: confirm bytes are actually served before committing to it.
+  const ctrl = new AbortController();
+  const timer = setTimeout(
+    () => ctrl.abort(),
+    result.source === "scdlp"
+      ? SCDLP_PLAYABILITY_TIMEOUT_MS
+      : PLAYABILITY_TIMEOUT_MS,
+  );
+  try {
+    const probe = await fetch(result.url, {
+      headers: { ...streamFetchHeaders(result.url, {}), range: "bytes=0-1" },
+      signal: ctrl.signal,
+    });
+    if (!probe.ok && probe.status !== 206) {
+      // A muted signing token is the one octave failure worth paying attention
+      // to: the probe retried every 6s since is useless, so drop the cached
+      // token now and let the next play mint a fresh one.
+      if (result.source === "octave" && (probe.status === 401 || probe.status === 403)) {
+        invalidateOctaveToken();
+      }
+      throw new Error(`upstream returned ${probe.status}`);
+    }
+    await probe.body?.cancel();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function resolveStreamWithFallback(
   id: string,
   isrc?: string,
   quality?: string,
   sourceHint?: SourcePriority,
   meta?: StreamMeta,
+  octaveToken?: string,
 ): Promise<StreamResult> {
-  const tried = new Set<SourcePriority>();
-  const attempt = (s: SourcePriority) =>
-    resolveFromSource(s, id, isrc, quality, sourceHint, meta).catch((e) => {
-      console.error(
-        `${s} stream failed:`,
-        e instanceof Error ? e.message : e,
-      );
-      throw e;
-    });
-
-  // Resolve with the first source in the tier that succeeds, or null if all fail.
-  const raceTier = async (
-    sources: SourcePriority[],
-  ): Promise<StreamResult | null> => {
-    const pending = sources.filter((s) => !tried.has(s));
-    pending.forEach((s) => tried.add(s));
-    if (pending.length === 0) return null;
+  const started = Date.now();
+  const attempt = async (s: SourcePriority) => {
     try {
-      return await Promise.any(pending.map(attempt));
-    } catch {
-      return null; // AggregateError — every source in this tier failed
+      const result = await resolveFromSource(
+        s,
+        id,
+        isrc,
+        quality,
+        sourceHint,
+        meta,
+        octaveToken,
+      );
+      await assertPlayable(result, meta);
+      console.log(`[stream] ${s} ready in ${Date.now() - started}ms`);
+      return result;
+    } catch (e) {
+      console.error(`${s} stream failed:`, e instanceof Error ? e.message : e);
+      throw e;
     }
   };
 
-  // 0) Deezer first when we have an ISRC — it's an exact ISRC match (most
-  //    accurate; other sources can return wrong versions/remasters).
-  if (isrc && !tried.has("deezer")) {
-    tried.add("deezer");
-    try {
-      return await attempt("deezer");
-    } catch {
-      /* fall through */
+  // Every source is raced at once and the first one to produce a *verified
+  // playable* stream wins — no quality tiers, no sequential fallback. A source
+  // that needs an ISRC it wasn't given rejects immediately and costs nothing.
+  const isOctavePick = sourceHint === "octave";
+  const candidateAllowed = (s: SourcePriority): boolean => {
+    if ((s === "qobuz" || s === "deezer") && !isrc) return false;
+    if (s === "scdlp" && SCDLP_BASES.length === 0) return false;
+    // Costs a round trip to learn what we already know locally: without a
+    // session it can only 401, and it can't match without a title+artist.
+    if (s === "monochrome" && !monochromeIsAuthed()) return false;
+    if (s === "monochrome" && !(meta?.title && meta?.artist)) return false;
+    // Octave mirrors Tidal's stream ids — without a Tidal context it can only
+    // 404 (and may waste a browser launch fetching a token for no reason).
+    if (s === "octave" && sourceHint !== "tidal" && sourceHint !== "octave")
+      return false;
+    // Picking Octave in the UI means the stream *should* come from Octave, so
+    // this pass races octave alone — the fallback below re-races everything
+    // else only when octave outright fails.
+    if (isOctavePick && s !== "octave") return false;
+    return true;
+  };
+
+  const candidates = SOURCE_ORDER.filter(candidateAllowed);
+
+  if (candidates.length === 0) throw new Error("No usable stream sources");
+
+  try {
+    return await Promise.any(candidates.map(attempt));
+  } catch (e) {
+    // A UI octave pick raced nothing but octave; if that failed (dead token,
+    // missing token, upstream down), re-race the rest so the play survives.
+    if (isOctavePick) {
+      const rest = SOURCE_ORDER.filter(
+        (s) => s !== "octave" && candidateAllowed(s),
+      );
+      if (rest.length > 0) {
+        try {
+          return await Promise.any(rest.map(attempt));
+        } catch (fallbackErr) {
+          const detail =
+            fallbackErr instanceof AggregateError
+              ? fallbackErr.errors
+                  .map((err, i) =>
+                    `${rest[i]}: ${err instanceof Error ? err.message : err}`,
+                  )
+                  .join(" | ")
+              : String(fallbackErr);
+          throw new Error(`All stream sources failed (octave then fallback) — ${detail}`);
+        }
+      }
     }
+    const detail =
+      e instanceof AggregateError
+        ? e.errors
+            .map((err, i) =>
+              `${candidates[i]}: ${err instanceof Error ? err.message : err}`,
+            )
+            .join(" | ")
+        : String(e);
+    throw new Error(`All stream sources failed — ${detail}`);
   }
-
-  // 1) Preferred source next (where the id natively lives).
-  if (sourceHint && !tried.has(sourceHint)) {
-    tried.add(sourceHint);
-    try {
-      return await attempt(sourceHint);
-    } catch {
-      /* fall through to the parallel tiers */
-    }
-  }
-
-  // 2) Remaining lossless sources, then 3) lossy sources — each raced in parallel.
-  const lossless = await raceTier(["tidal", "qobuz", "deezer"]);
-  if (lossless) return lossless;
-  const lossy = await raceTier(["soundcloud", "youtube"]);
-  if (lossy) return lossy;
-
-  throw new Error("All stream sources failed");
 }
 
-// Quality token → Deezer format (mirrors Monochrome's getDeezerStreamFormat).
 const DEEZER_QUALITY_FORMATS: Record<string, string> = {
   HI_RES_LOSSLESS: "FLAC",
   LOSSLESS: "FLAC",
@@ -954,11 +1356,6 @@ const DEEZER_QUALITY_FORMATS: Record<string, string> = {
   NORMAL: "MP3_128",
 };
 
-/**
- * Resolve a stream from a Deezer ISRC-fallback instance. The /stream/ endpoint
- * serves the audio directly; we validate with a 1-byte range so a miss falls
- * through to the next source instead of handing back a URL that 404s mid-play.
- */
 async function resolveDeezerStreamUrl(
   isrc: string,
   quality?: string,
@@ -981,10 +1378,6 @@ async function resolveDeezerStreamUrl(
           signal: ctrl.signal,
         });
       } catch {
-        // Timeout / network blip. A *missing* track 404s fast (~250ms), so a
-        // stall means the instance is warming this track (cold start can take
-        // 90s+). Hand back the URL and let the stream proxy wait it out rather
-        // than failing the whole resolve.
         clearTimeout(t);
         return { url, mimeType };
       }
@@ -993,7 +1386,7 @@ async function resolveDeezerStreamUrl(
       if (res.ok || res.status === 206) return { url, mimeType };
       if (res.status === 404) {
         lastErr = new Error("Deezer 404 (no match)");
-        continue; // genuine miss — try next base / fall through to other sources
+        continue;
       }
       lastErr = new Error(`Deezer HTTP ${res.status}`);
     } catch (e) {
@@ -1012,9 +1405,10 @@ async function resolveSoundcloudStreamUrl(
 
   const clientId = await getValidClientId();
 
-  // SoundCloud API v2 uses media.transcodings; prefer progressive (direct MP3)
   const transcodings = track.media?.transcodings || [];
-  const progressive = transcodings.find((t) => t.format?.protocol === "progressive");
+  const progressive = transcodings.find(
+    (t) => t.format?.protocol === "progressive",
+  );
   const hls = transcodings.find((t) => t.format?.protocol === "hls");
   const transcoding = progressive || hls;
 
@@ -1026,21 +1420,26 @@ async function resolveSoundcloudStreamUrl(
     const res = await fetch(resolveUrl.toString(), {
       signal: ctrl.signal,
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         Accept: "application/json",
         Origin: "https://soundcloud.com",
         Referer: "https://soundcloud.com/",
       },
     });
     clearTimeout(timeout);
-    if (!res.ok) throw new Error(`SoundCloud transcoding resolve failed: ${res.status}`);
+    if (!res.ok) {
+      discard(res);
+      throw new Error(`SoundCloud transcoding resolve failed: ${res.status}`);
+    }
     const data = (await res.json()) as { url: string };
     if (!data.url) throw new Error("No URL in SoundCloud transcoding response");
-    const mimeType = progressive ? "audio/mpeg" : "application/vnd.apple.mpegurl";
+    const mimeType = progressive
+      ? "audio/mpeg"
+      : "application/vnd.apple.mpegurl";
     return { url: data.url, mimeType };
   }
 
-  // Legacy: some tracks still have stream_url
   if (track.stream_url) {
     const streamUrl = new URL(track.stream_url);
     streamUrl.searchParams.set("client_id", clientId);
@@ -1048,6 +1447,181 @@ async function resolveSoundcloudStreamUrl(
   }
 
   throw new Error("No stream available for this SoundCloud track");
+}
+
+// --- yt-dlp SoundCloud backend (soundcloud-backend/) ------------------------
+
+interface ScDlpTrack {
+  url: string;
+  title: string;
+  artist: string;
+  artistUrl?: string;
+  duration: number;
+  thumb?: string;
+  src?: string;
+}
+
+const SCDLP_TIMEOUT_MS = Number(process.env.SC_DLP_TIMEOUT_MS) || 8000;
+
+/** The backend streams search hits as SSE so the UI can render them as they
+ * land. We only want the finished list, so collect until [DONE] or timeout. */
+async function scdlpSse(url: string, timeoutMs: number): Promise<ScDlpTrack[]> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) {
+      discard(res);
+      throw new Error(`scdlp HTTP ${res.status}`);
+    }
+    const body = await res.text();
+    const out: ScDlpTrack[] = [];
+    for (const line of body.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const t = JSON.parse(payload) as ScDlpTrack;
+        if (t?.url) out.push(t);
+      } catch {}
+    }
+    return out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeForMatch(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/** Pick the search hit that actually corresponds to the requested track.
+ * SoundCloud search is full of remixes, slowed edits and DJ sets, and playing
+ * one of those instead of the song is worse than the source failing. */
+function pickScDlpMatch(
+  results: ScDlpTrack[],
+  artist: string,
+  title: string,
+  durationSec?: number,
+): ScDlpTrack | null {
+  const wantTitle = normalizeForMatch(title);
+  const wantArtist = normalizeForMatch(artist);
+  let best: { t: ScDlpTrack; score: number } | null = null;
+
+  for (const t of results) {
+    const gotTitle = normalizeForMatch(t.title || "");
+    const gotArtist = normalizeForMatch(t.artist || "");
+    let score = 0;
+
+    if (gotTitle.includes(wantTitle)) score += 40;
+    else continue; // wrong song entirely
+
+    if (gotArtist.includes(wantArtist) || gotTitle.includes(wantArtist))
+      score += 30;
+    if (YT_JUNK_TERMS.some((k) => (t.title || "").toLowerCase().includes(k)))
+      score -= 60;
+
+    if (durationSec && t.duration) {
+      const diff = Math.abs(t.duration - durationSec);
+      if (diff <= 3) score += 30;
+      else if (diff <= 8) score += 15;
+      else if (diff > 30) score -= 40;
+    }
+
+    if (score > 0 && (!best || score > best.score)) best = { t, score };
+  }
+
+  return best?.t ?? null;
+}
+
+async function scdlpSearch(
+  query: string,
+  limit: number,
+): Promise<ClientTrack[]> {
+  let lastErr: unknown;
+  for (const base of SCDLP_BASES) {
+    const url = `${base.replace(/\/+$/, "")}/api/music/search?q=${encodeURIComponent(
+      query,
+    )}&limit=${Math.min(limit, 40)}`;
+    try {
+      const hits = await scdlpSse(url, SCDLP_TIMEOUT_MS);
+      if (hits.length === 0) continue;
+      return hits.map((t) => ({
+        id: t.url,
+        title: t.title || "Unknown",
+        artist: t.artist || "Unknown",
+        artwork: t.thumb || "",
+        duration: t.duration || 0,
+        explicit: false,
+        source: "scdlp" as const,
+        permalinkUrl: t.url,
+      }));
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (lastErr) throw lastErr;
+  return [];
+}
+
+/** Resolve to the backend's own range-capable audio endpoint. The service
+ * downloads and disk-caches the track, so the URL is stable and seekable —
+ * our /api/music/stream proxy can pipe it straight through. */
+async function resolveScDlpStreamUrl(
+  id: string,
+  sourceHint: SourcePriority | undefined,
+  meta: StreamMeta | undefined,
+): Promise<{ url: string; mimeType: string }> {
+  if (SCDLP_BASES.length === 0) throw new Error("No scdlp base configured");
+
+  const direct = /^https?:\/\/(www\.)?soundcloud\.com\//i.test(id) ? id : null;
+
+  let lastErr: unknown;
+  for (const base of SCDLP_BASES) {
+    const root = base.replace(/\/+$/, "");
+    try {
+      let permalink = direct;
+
+      if (!permalink) {
+        if (!meta?.artist || !meta?.title) {
+          throw new Error("No SoundCloud URL or artist/title to search with");
+        }
+        const hits = await scdlpSse(
+          `${root}/api/music/search?q=${encodeURIComponent(
+            `${meta.artist} ${meta.title}`,
+          )}&limit=10`,
+          SCDLP_TIMEOUT_MS,
+        );
+        const match = pickScDlpMatch(
+          hits,
+          meta.artist,
+          meta.title,
+          meta.duration,
+        );
+        if (!match) throw new Error("No scdlp match for this track");
+        permalink = match.url;
+      }
+
+      // Kick the download off now so the cache is filling while the race is
+      // still running; the playability probe below is what decides whether
+      // this source is actually ready to serve.
+      const streamUrl = `${root}/api/sc/stream?url=${encodeURIComponent(permalink)}`;
+      fetch(`${root}/api/music/prewarm`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: permalink }),
+      }).catch(() => {});
+
+      return { url: streamUrl, mimeType: "audio/mpeg" };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr ?? new Error("All scdlp bases failed");
 }
 
 async function resolveTidalStreamUrl(
@@ -1060,12 +1634,6 @@ async function resolveTidalStreamUrl(
   isDash?: boolean;
   rawDash?: string;
 }> {
-  // NOTE: streaming intentionally goes through the external HiFi instances
-  // (which hold real Tidal user tokens). The in-process adapter only has a
-  // client-credentials token, which Tidal restricts to 30-second previews —
-  // useless for playback. Full-track in-process streaming needs a subscription
-  // user token (OAuth device login); until then, instances + the
-  // qobuz/deezer/etc. fallback chain serve full tracks.
   const data = await callMusicApi<any>(
     "/trackManifests/",
     { id, quality, adaptive: "false", formats: "FLAC" },
@@ -1091,17 +1659,71 @@ async function resolveTidalStreamUrl(
   };
 }
 
+// youtube-dl-exec defaults to a yt-dlp it downloads into its own node_modules
+// during postinstall. That download is skipped by --frozen-lockfile installs,
+// CI caches and offline installs, leaving the package pointed at a binary that
+// isn't there — every YouTube resolve then dies on ENOENT, which reads as
+// "the fallback doesn't work" rather than as a missing dependency. Prefer an
+// explicitly configured path, then the bundled one, then whatever yt-dlp is on
+// PATH.
+let ytDlpPathPromise: Promise<string | null> | null = null;
+function resolveYtDlpPath(): Promise<string | null> {
+  if (!ytDlpPathPromise) {
+    ytDlpPathPromise = (async () => {
+      const mod = (await import("youtube-dl-exec")) as unknown as {
+        constants?: { YOUTUBE_DL_PATH?: string };
+      };
+      const candidates = [
+        process.env.YT_DLP_PATH,
+        mod.constants?.YOUTUBE_DL_PATH,
+        "/usr/local/bin/yt-dlp",
+        "/usr/bin/yt-dlp",
+      ].filter((p): p is string => !!p);
+      for (const candidate of candidates) {
+        try {
+          await fsp.access(candidate, fsConstants.X_OK);
+          return candidate;
+        } catch {
+          // try the next one
+        }
+      }
+      return null;
+    })();
+  }
+  return ytDlpPathPromise;
+}
+
+// yt-dlp can sit for minutes when YouTube throws a bot check at it. Without a
+// bound the request never settles and the player just spins, so cap it and let
+// the caller move on to the next source.
+const YT_DLP_TIMEOUT_MS = Number(process.env.YT_DLP_TIMEOUT_MS) || 20000;
+
 async function resolveYoutubeStreamUrl(
   videoId: string,
 ): Promise<{ url: string; mimeType: string }> {
-  const { default: youtubeDl } = await import("youtube-dl-exec");
+  const binaryPath = await resolveYtDlpPath();
+  if (!binaryPath) {
+    throw new Error(
+      "yt-dlp not found. Install it, or set YT_DLP_PATH to its location.",
+    );
+  }
+  const { create } = await import("youtube-dl-exec");
+  const youtubeDl = create(binaryPath);
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const info = (await youtubeDl(videoUrl, {
-    format: "bestaudio",
-    getUrl: true,
-  })) as string;
+  // Third argument is execa's options, not yt-dlp's: anything in the second
+  // object is turned into a CLI flag, so a timeout there becomes --timeout and
+  // yt-dlp exits on "no such option".
+  const info = (await youtubeDl(
+    videoUrl,
+    { format: "bestaudio", getUrl: true },
+    { timeout: YT_DLP_TIMEOUT_MS },
+  )) as unknown as string;
+  const url = String(info).trim().split("\n")[0];
+  if (!url.startsWith("http")) {
+    throw new Error("yt-dlp returned no stream URL");
+  }
   return {
-    url: info.trim(),
+    url,
     mimeType: "audio/mp4",
   };
 }
@@ -1124,10 +1746,14 @@ export async function musicRoutes(fastify: FastifyInstance) {
 
   fastify.post("/api/music/source", async (req, reply) => {
     const { source } = req.body as { source?: SourcePriority };
-    if (
-      source &&
-      ["tidal", "qobuz", "soundcloud", "youtube"].includes(source)
-    ) {
+    // Stream-only sources normally can't be picked (they have no search of
+    // their own). Octave is the exception: selecting it in the UI means "stream
+    // this through octave", so it is allowed here and search still backfills
+    // from Tidal (its ids are Tidal ids anyway).
+    const selectable = SOURCE_ORDER.filter(
+      (s) => s === "octave" || !STREAM_ONLY_SOURCES.has(s),
+    );
+    if (source && selectable.includes(source)) {
       currentSourcePriority = source;
       return reply.send({
         current: currentSourcePriority,
@@ -1137,8 +1763,71 @@ export async function musicRoutes(fastify: FastifyInstance) {
     return musicError(
       reply,
       400,
-      "Invalid source. Use: tidal, qobuz, soundcloud, or youtube",
+      `Invalid source. Use one of: ${selectable.join(", ")}`,
     );
+  });
+
+  // Monochrome's resolver gates /playback behind Cloudflare Turnstile, which
+  // only a real browser can satisfy. A human opens this page once and the
+  // resulting session is cached server-side and reused until it expires.
+  fastify.get("/api/music/monochrome/auth", async (_req, reply) => {
+    const cfg = await monochromeGetConfig();
+    return reply.type("text/html").send(MONOCHROME_AUTH_PAGE(cfg.turnstile_site_key));
+  });
+
+  fastify.post("/api/music/monochrome/turnstile", async (req, reply) => {
+    const token = (req.body as { turnstile_token?: string })?.turnstile_token;
+    if (!token)
+      return reply.code(400).send({ ok: false, error: "missing turnstile_token" });
+    try {
+      const exp = await monochromeExchangeTurnstile(token);
+      return reply.send({ ok: true, expiresAt: exp });
+    } catch (e) {
+      return reply
+        .code(502)
+        .send({ ok: false, error: e instanceof Error ? e.message : "failed" });
+    }
+  });
+
+  // Carries the site key so the client can render the widget off one call
+  // rather than round-tripping to the upstream /config itself.
+  fastify.get("/api/music/monochrome/status", async (_req, reply) => {
+    const state = monochromeAuthState();
+    let siteKey: string | null = null;
+    let action = "auth";
+    let enabled = true;
+    if (!state.authenticated) {
+      try {
+        const cfg = await monochromeGetConfig();
+        siteKey = cfg.turnstile_site_key;
+        action = cfg.turnstile_action || "auth";
+        enabled = cfg.turnstile_enabled !== false;
+      } catch {
+        // Leaving siteKey null makes the client skip silently instead of
+        // rendering a widget that can't possibly validate.
+      }
+    }
+    return reply.send({ ...state, siteKey, action, turnstileEnabled: enabled });
+  });
+
+  // Octave mints its playback token by driving a real browser
+  // (scripts/get-pbtoken.mjs) — there is no HTTP endpoint that issues it.
+  // Status lets an operator see whether the token pipeline is warm before
+  // blaming an octave win/loss on the stream itself.
+  fastify.get("/api/music/octave/status", async (_req, reply) => {
+    return reply.send({
+      ...octaveStatus(),
+      script: octaveScriptPath(),
+    });
+  });
+
+  fastify.post("/api/music/octave/refresh", async (_req, reply) => {
+    const token = await refreshOctaveToken();
+    return reply.send({
+      ...octaveStatus(),
+      refreshed: !!token,
+      script: octaveScriptPath(),
+    });
   });
 
   fastify.post("/api/music/ping", async (req, reply) => {
@@ -1163,77 +1852,96 @@ export async function musicRoutes(fastify: FastifyInstance) {
 
     if (sourceToUse === "tidal") {
       try {
-        // Try ?q= first (combined search, returns all categories in one shot)
-        // Fall back to parallel ?s= (tracks) + ?al= (albums) + ?a= (artists)
         let trackItems: TidalTrack[] = [];
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
         let albumItems: any[] = [];
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
         let artistItems: any[] = [];
 
-        const combined = await callMusicApi<unknown>("/search/", { q: q.trim(), limit: lim }).catch(() => null);
+        const combined = await callMusicApi<unknown>("/search/", {
+          q: q.trim(),
+          limit: lim,
+        }).catch(() => null);
         if (combined) {
           trackItems = extractSearchSection(combined, "tracks") as TidalTrack[];
           albumItems = extractSearchSection(combined, "albums");
           artistItems = extractSearchSection(combined, "artists");
         }
 
-        // If combined didn't give tracks, fall back to parallel scoped searches
         if (trackItems.length === 0) {
-          const [tracksResp, albumsResp, artistsResp] = await Promise.allSettled([
-            callMusicApi<unknown>("/search/", { s: q.trim(), limit: lim }),
-            callMusicApi<unknown>("/search/", { al: q.trim(), limit: Math.min(lim, 20) }),
-            callMusicApi<unknown>("/search/", { a: q.trim(), limit: Math.min(lim, 12) }),
-          ]);
+          const [tracksResp, albumsResp, artistsResp] =
+            await Promise.allSettled([
+              callMusicApi<unknown>("/search/", { s: q.trim(), limit: lim }),
+              callMusicApi<unknown>("/search/", {
+                al: q.trim(),
+                limit: Math.min(lim, 20),
+              }),
+              callMusicApi<unknown>("/search/", {
+                a: q.trim(),
+                limit: Math.min(lim, 12),
+              }),
+            ]);
 
           if (tracksResp.status === "fulfilled") {
-            // ?s= returns flat { data: { items: [...] } }
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const raw: any = (tracksResp.value as any)?.data ?? tracksResp.value;
+            const raw: any =
+              (tracksResp.value as any)?.data ?? tracksResp.value;
             if (Array.isArray(raw?.items)) trackItems = raw.items;
           }
           if (albumItems.length === 0 && albumsResp.status === "fulfilled") {
             albumItems = extractSearchSection(albumsResp.value, "albums");
           }
           if (artistItems.length === 0 && artistsResp.status === "fulfilled") {
-            // ?a= might return flat items or nested artists section
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const raw: any = (artistsResp.value as any)?.data ?? artistsResp.value;
+            const raw: any =
+              (artistsResp.value as any)?.data ?? artistsResp.value;
             artistItems = Array.isArray(raw?.items)
               ? raw.items
               : extractSearchSection(artistsResp.value, "artists");
           }
         }
 
-        const tracks: ClientTrack[] = trackItems.map((t) => toClientTrack(t)).slice(0, lim);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const albums: ClientAlbum[] = albumItems.map((a: any) => toClientAlbum(a)).slice(0, 12);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const artists: ClientArtist[] = artistItems.map((a: any) => toClientArtist(a)).slice(0, 12);
+        const tracks: ClientTrack[] = trackItems
+          .map((t) => toClientTrack(t))
+          .slice(0, lim);
+
+        const albums: ClientAlbum[] = albumItems
+          .map((a: any) => toClientAlbum(a))
+          .slice(0, 12);
+
+        const artists: ClientArtist[] = artistItems
+          .map((a: any) => toClientArtist(a))
+          .slice(0, 12);
 
         if (tracks.length > 0 || albums.length > 0 || artists.length > 0) {
           reply.header("cache-control", "public, max-age=120");
-          return reply.send({ items: tracks, albums, artists, source: "tidal" });
+          return reply.send({
+            items: tracks,
+            albums,
+            artists,
+            source: "tidal",
+          });
         }
-      } catch {
-        // fall through to priority-based search
-      }
+      } catch {}
     }
 
     const items = await searchWithPriority(q, lim, source);
     reply.header("cache-control", "public, max-age=120");
-    return reply.send({ items, albums: [], artists: [], source: currentSourcePriority });
+    return reply.send({
+      items,
+      albums: [],
+      artists: [],
+      source: currentSourcePriority,
+    });
   });
 
   fastify.get("/api/music/album/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
     try {
       const data = await callMusicApi<unknown>("/album/", { id });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
       const raw: any = (data as any)?.data ?? data;
 
       let albumRaw: any = null;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
       let trackItems: any[] = [];
 
       if (raw && typeof raw === "object" && !Array.isArray(raw)) {
@@ -1255,7 +1963,7 @@ export async function musicRoutes(fastify: FastifyInstance) {
 
       const album = toClientAlbum(albumRaw);
       const tracks: ClientTrack[] = trackItems
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
         .map((i: any) => toClientTrack(i.item || i))
         .filter((t) => t.id);
 
@@ -1272,7 +1980,7 @@ export async function musicRoutes(fastify: FastifyInstance) {
     const { id } = req.params as { id: string };
     try {
       const data = await callMusicApi<unknown>("/artist/", { id });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
       const raw: any = (data as any)?.data ?? data;
 
       const artistRaw =
@@ -1283,11 +1991,9 @@ export async function musicRoutes(fastify: FastifyInstance) {
 
       const artist = toClientArtist(artistRaw);
 
-      // Collect albums and tracks from nested response
       const albumMap = new Map<number, ClientAlbum>();
       const trackMap = new Map<number, ClientTrack>();
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const scan = (value: any, visited: Set<unknown>) => {
         if (!value || typeof value !== "object" || visited.has(value)) return;
         visited.add(value);
@@ -1296,21 +2002,26 @@ export async function musicRoutes(fastify: FastifyInstance) {
           return;
         }
         const item = value.item || value;
-        const hasAlbumFields = "numberOfTracks" in item || "numberOfItems" in item;
+        const hasAlbumFields =
+          "numberOfTracks" in item || "numberOfItems" in item;
         const hasTrackFields = item.duration && item.trackNumber != null;
-        if (hasAlbumFields && item.id) albumMap.set(item.id, toClientAlbum(item));
-        else if (hasTrackFields && item.id) trackMap.set(item.id, toClientTrack(item));
+        if (hasAlbumFields && item.id)
+          albumMap.set(item.id, toClientAlbum(item));
+        else if (hasTrackFields && item.id)
+          trackMap.set(item.id, toClientTrack(item));
         Object.values(value).forEach((nested) => scan(nested, visited));
       };
 
       scan(raw, new Set());
 
-      // Fallback: try /artist/?f= for albums
       if (albumMap.size === 0) {
         try {
-          const albumsData = await callMusicApi<unknown>("/artist/", { f: id, skip_tracks: "true" });
+          const albumsData = await callMusicApi<unknown>("/artist/", {
+            f: id,
+            skip_tracks: "true",
+          });
           scan((albumsData as any)?.data ?? albumsData, new Set());
-        } catch { /* ignore */ }
+        } catch {}
       }
 
       const allAlbums = Array.from(albumMap.values()).sort((a, b) =>
@@ -1334,10 +2045,13 @@ export async function musicRoutes(fastify: FastifyInstance) {
   fastify.get("/api/music/artist/:id/similar", async (req, reply) => {
     const { id } = req.params as { id: string };
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const data = await callMusicApi<any>("/artist/similar/", { id });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const artists: ClientArtist[] = (data?.artists || data?.data?.artists || []).map((a: any) => toClientArtist(a));
+
+      const artists: ClientArtist[] = (
+        data?.artists ||
+        data?.data?.artists ||
+        []
+      ).map((a: any) => toClientArtist(a));
       reply.header("cache-control", "public, max-age=600");
       return reply.send({ artists });
     } catch (error) {
@@ -1348,13 +2062,16 @@ export async function musicRoutes(fastify: FastifyInstance) {
   fastify.get("/api/music/album/:id/similar", async (req, reply) => {
     const { id } = req.params as { id: string };
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const data = await callMusicApi<any>("/album/similar/", { id });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
       const raw = data?.data ?? data;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const items = Array.isArray(raw?.items) ? raw.items : Array.isArray(raw) ? raw : [];
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
+      const items = Array.isArray(raw?.items)
+        ? raw.items
+        : Array.isArray(raw)
+          ? raw
+          : [];
+
       const albums: ClientAlbum[] = items.map((a: any) => toClientAlbum(a));
       reply.header("cache-control", "public, max-age=600");
       return reply.send({ albums });
@@ -1363,14 +2080,90 @@ export async function musicRoutes(fastify: FastifyInstance) {
     }
   });
 
+  // DASH segment relay. The upstream host is pinned to AUDIO_PROXY_BASE, so
+  // the wildcard can't be aimed at internal services — the only thing the
+  // caller controls is the path handed to a proxy that is already publicly
+  // reachable on its own.
+  fastify.get(`${SEGMENT_PREFIX}*`, async (req, reply) => {
+    const raw = (req.params as Record<string, string>)["*"] ?? "";
+    let target: string;
+    try {
+      target = decodeURIComponent(raw);
+    } catch {
+      return musicError(reply, 400, "Malformed segment URL");
+    }
+    if (!/^https:\/\//i.test(target)) {
+      return musicError(reply, 400, "Segment URL must be https");
+    }
+
+    const headers: Record<string, string> = {};
+    const range = req.headers.range;
+    if (typeof range === "string") headers["range"] = range;
+
+    // Tie the upstream fetch to the client connection. Without this, a client
+    // that goes away mid-stream (skip, seek, closed tab) leaves the upstream
+    // pulling audio into a buffer nobody will ever read.
+    const abort = new AbortController();
+    req.raw.on("close", () => abort.abort());
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(`${AUDIO_PROXY_BASE}/${target}`, {
+        headers,
+        signal: abort.signal,
+        // Bun honours this per-request; it does not leak to other fetches.
+        ...(AUDIO_PROXY_INSECURE
+          ? { tls: { rejectUnauthorized: false } }
+          : {}),
+      } as RequestInit);
+    } catch (e) {
+      return musicError(reply, 502, "Segment fetch failed", {
+        detail: e instanceof Error ? e.message : String(e),
+      });
+    }
+
+    reply.code(upstream.status);
+    for (const h of [
+      "content-type",
+      "content-length",
+      "content-range",
+      "accept-ranges",
+    ]) {
+      const v = upstream.headers.get(h);
+      if (v) reply.header(h, v);
+    }
+    reply.header("cache-control", "private, max-age=3600");
+    reply.header("access-control-allow-origin", "*");
+    if (!upstream.body) return reply.send();
+    // Counted so /api/system/memory can show whether streams are actually
+    // being torn down. A rising `open` that never falls means buffered audio
+    // is accumulating in stream plumbing the JS heap never sees.
+    streamProxy.open++;
+    streamProxy.started++;
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      streamProxy.open--;
+      streamProxy.finished++;
+    };
+    const node = Readable.fromWeb(upstream.body as unknown as NodeReadableStream);
+    node.on("close", done);
+    node.on("error", done);
+    reply.raw.on("close", done);
+    return reply.send(node);
+  });
+
   fastify.get("/api/music/stream", async (req, reply) => {
-    const { id, quality, isrc, source, title, artist } = req.query as {
+    const { id, quality, isrc, source, title, artist, duration, k } = req.query as {
       id?: string;
       quality?: string;
       isrc?: string;
       source?: SourcePriority;
       title?: string;
       artist?: string;
+      duration?: string;
+      k?: string;
     };
     if (!id) return musicError(reply, 400, "Missing required parameter: id");
 
@@ -1386,7 +2179,8 @@ export async function musicRoutes(fastify: FastifyInstance) {
         isrc,
         quality,
         sourceToUse,
-        { title, artist },
+        { title, artist, duration: duration ? Number(duration) : undefined },
+        k,
       );
       streamUrl = result.url;
       streamMime = result.mimeType;
@@ -1400,10 +2194,18 @@ export async function musicRoutes(fastify: FastifyInstance) {
     const range = req.headers.range;
     if (typeof range === "string") headers["range"] = range;
 
+    // Same as the segment proxy: without binding the upstream to the client
+    // connection, every skip and every seek orphans a live audio stream that
+    // keeps buffering into memory. Seeking is the worst case, because each
+    // seek opens a fresh range request and abandons the previous one.
+    const abort = new AbortController();
+    req.raw.on("close", () => abort.abort());
+
     let upstream: Response;
     try {
       upstream = await fetch(streamUrl, {
         headers: streamFetchHeaders(streamUrl, headers),
+        signal: abort.signal,
       });
     } catch (e) {
       return musicError(reply, 502, "Upstream fetch failed", {
@@ -1427,19 +2229,35 @@ export async function musicRoutes(fastify: FastifyInstance) {
     reply.header("cache-control", "no-store");
 
     if (!upstream.body) return reply.send();
-    return reply.send(
-      Readable.fromWeb(upstream.body as unknown as NodeReadableStream),
-    );
+    // Counted so /api/system/memory can show whether streams are actually
+    // being torn down. A rising `open` that never falls means buffered audio
+    // is accumulating in stream plumbing the JS heap never sees.
+    streamProxy.open++;
+    streamProxy.started++;
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      streamProxy.open--;
+      streamProxy.finished++;
+    };
+    const node = Readable.fromWeb(upstream.body as unknown as NodeReadableStream);
+    node.on("close", done);
+    node.on("error", done);
+    reply.raw.on("close", done);
+    return reply.send(node);
   });
 
   fastify.get("/api/music/track", async (req, reply) => {
-    const { id, quality, isrc, source, title, artist } = req.query as {
+    const { id, quality, isrc, source, title, artist, duration, k } = req.query as {
       id?: string;
       quality?: string;
       isrc?: string;
       source?: SourcePriority;
       title?: string;
       artist?: string;
+      duration?: string;
+      k?: string;
     };
     if (!id) return musicError(reply, 400, "Missing required parameter: id");
 
@@ -1452,8 +2270,10 @@ export async function musicRoutes(fastify: FastifyInstance) {
         isrc,
         quality,
         sourceToUse,
-        { title, artist },
+        { title, artist, duration: duration ? Number(duration) : undefined },
+        k,
       );
+      if (result.source === "octave") result.url = redactOctaveToken(result.url);
       return reply.send(result);
     } catch (error) {
       return musicError(reply, 502, "All stream sources failed", {
@@ -1463,30 +2283,33 @@ export async function musicRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get("/api/music/manifest", async (req, reply) => {
-    const { id, quality, isrc, artist, title, source } = req.query as {
-      id?: string;
-      quality?: string;
-      isrc?: string;
-      artist?: string;
-      title?: string;
-      source?: SourcePriority;
-    };
+    const { id, quality, isrc, artist, title, source, duration, k } =
+      req.query as {
+        id?: string;
+        quality?: string;
+        isrc?: string;
+        artist?: string;
+        title?: string;
+        source?: SourcePriority;
+        duration?: string;
+        k?: string;
+      };
 
     if (!id) return musicError(reply, 400, "Missing required parameter: id");
 
     schedulePing();
     const sourceToUse = source || currentSourcePriority;
 
-    // Deezer first — exact ISRC match (most accurate). Non-DASH: the client
-    // plays it through /api/music/stream. Falls through on miss.
     if (isrc) {
       try {
         const d = await resolveDeezerStreamUrl(isrc, quality);
         reply.header("cache-control", "no-store");
-        return reply.send({ url: d.url, mimeType: d.mimeType, source: "deezer" });
-      } catch {
-        /* fall through to other sources */
-      }
+        return reply.send({
+          url: d.url,
+          mimeType: d.mimeType,
+          source: "deezer",
+        });
+      } catch {}
     }
 
     try {
@@ -1495,8 +2318,10 @@ export async function musicRoutes(fastify: FastifyInstance) {
         isrc,
         quality,
         sourceToUse,
-        { title, artist },
+        { title, artist, duration: duration ? Number(duration) : undefined },
+        k,
       );
+      if (result.source === "octave") result.url = redactOctaveToken(result.url);
 
       if (result.source === "tidal" && (result.isDash || result.rawDash)) {
         let rawDash = result.rawDash;
@@ -1504,9 +2329,14 @@ export async function musicRoutes(fastify: FastifyInstance) {
           const mpdRes = await fetch(result.url);
           rawDash = await mpdRes.text();
         }
+        // Absolute, not relative: the player loads this MPD from a blob URL
+        // when clearkey DRM is in play, and relative segment paths would
+        // resolve against blob: and 404.
+        const self = `${req.protocol}://${req.headers.host}`;
         const rewritten = rawDash.replace(
           /(initialization|media)="(https:\/\/[^"]+)"/g,
-          (_, attr, url) => `${attr}="${AUDIO_PROXY_BASE}/${url}"`,
+          (_, attr, url) =>
+            `${attr}="${self}${SEGMENT_PREFIX}${encodeURIComponent(url)}"`,
         );
         reply.header("content-type", "application/dash+xml");
         reply.header("cache-control", "private, max-age=300");

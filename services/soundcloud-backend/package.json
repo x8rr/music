@@ -1,0 +1,12 @@
+{
+  "name": "soundcloud-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Standalone SoundCloud streaming/search backend extracted from ZODIAC",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
