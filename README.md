@@ -13,3 +13,6 @@ a simple music implementation in fastify
 - tidal (used for searching)
 - deezer
 - qobuz
+
+## setup
+umm ask claude because there's no docs right now, i'll write some later, but for now just ask claude to implement it for you. there are some instructions in the soundcloud folder !
