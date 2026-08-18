@@ -4,9 +4,12 @@
 # x8rr/music
 a simple music implementation in fastify
 
-## sources
-- deezer (best source)
-- tidal
-- youtube (requires extra setup, see ytdlp docs)
+## sources that work
+- octave (newest, best)
+- soundcloud
+- youtube
+
+## dead sources but still included for some reason
+- tidal (used for searching)
+- deezer
 - qobuz
-- soundcloud (broken most of the time)
