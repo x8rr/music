@@ -5,7 +5,6 @@
 a simple music implementation in fastify
 
 ## sources that work
-- octave (newest, best)
 - soundcloud
 - youtube
 
@@ -13,6 +12,7 @@ a simple music implementation in fastify
 - tidal (used for searching)
 - deezer
 - qobuz
+- octave
 
 ## setup
 umm ask claude because there's no docs right now, i'll write some later, but for now just ask claude to implement it for you. there are some instructions in the soundcloud folder !
