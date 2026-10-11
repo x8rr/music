@@ -1,24 +1,35 @@
-// In-process Tidal adapter — a self-hosted "HiFi API" so Tidal search and
-// streaming don't depend on the flaky public instances. Uses the public
-// client-credentials app (same as Monochrome) routed through a region proxy,
-// which is enough for catalog search and FLAC playbackinfo manifests.
+
+
+
+
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || "txNoH4kkV41MfH25";
 const CLIENT_SECRET =
   process.env.TIDAL_CLIENT_SECRET ||
   "dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=";
 const COUNTRY = process.env.TIDAL_COUNTRY || "US";
-// api.tidal.com geo-blocks datacenter IPs; the proxy is what lets the
-// client-credentials token reach playbackinfo (Monochrome uses the same one).
-const TIDAL_PROXY =
-  process.env.TIDAL_PROXY || "https://td.if-it-runs-ship-it.lol/api";
+
+
+// The old default proxy (td.if-it-runs-ship-it.lol) no longer resolves, so
+// every call here failed on DNS and search leaned on a single hifi mirror.
+// api.tidal.com answers the prod box directly (checked 2026-09-29).
+const TIDAL_PROXY = process.env.TIDAL_PROXY || "https://api.tidal.com";
 
 const TIMEOUT_MS = Number(process.env.TIDAL_TIMEOUT_MS) || 8000;
 
 let cachedToken: { value: string; exp: number } | null = null;
+let tokenJob: Promise<string> | null = null;
 
-async function getToken(): Promise<string> {
-  if (cachedToken && Date.now() < cachedToken.exp) return cachedToken.value;
+// One token request at a time, and bounded: every search waits on Tidal for
+// its albums, so a hung token fetch used to hang them all.
+function getToken(): Promise<string> {
+  if (cachedToken && Date.now() < cachedToken.exp) return Promise.resolve(cachedToken.value);
+  tokenJob ??= fetchToken().finally(() => (tokenJob = null));
+  return tokenJob;
+}
+
+async function fetchToken(): Promise<string> {
   const res = await fetch("https://auth.tidal.com/v1/oauth2/token", {
+    signal: AbortSignal.timeout(TIMEOUT_MS),
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
@@ -36,13 +47,13 @@ async function getToken(): Promise<string> {
   const data = (await res.json()) as { access_token: string; expires_in?: number };
   cachedToken = {
     value: data.access_token,
-    // refresh a minute early
+    
     exp: Date.now() + (data.expires_in ?? 3600) * 1000 - 60_000,
   };
   return cachedToken.value;
 }
 
-async function tidalApi<T>(
+export async function tidalApi<T>(
   path: string,
   params: Record<string, string | number | undefined> = {},
 ): Promise<T> {
@@ -67,7 +78,7 @@ async function tidalApi<T>(
   }
 }
 
-/** Track search — returns the Tidal v1 shape cherri's toClientTrack expects. */
+
 export async function tidalSearchTracks(
   query: string,
   limit: number,
@@ -75,19 +86,10 @@ export async function tidalSearchTracks(
   return tidalApi("/v1/search/tracks", { query, limit });
 }
 
-/** Resolve a FLAC DASH manifest for a track (decoded, ready to rewrite). */
-export async function tidalTrackManifest(
-  id: string,
-): Promise<{ rawDash: string; mimeType: string }> {
-  const pb = await tidalApi<{ manifest?: string; manifestMimeType?: string }>(
-    `/v1/tracks/${id}/playbackinfo`,
-    {
-      audioquality: "LOSSLESS",
-      playbackmode: "STREAM",
-      assetpresentation: "FULL",
-    },
-  );
-  if (!pb?.manifest) throw new Error("Tidal playbackinfo returned no manifest");
-  const rawDash = Buffer.from(pb.manifest, "base64").toString("utf8");
-  return { rawDash, mimeType: pb.manifestMimeType || "application/dash+xml" };
+
+export async function tidalPlaylistTracks(
+  uuid: string,
+  limit: number,
+): Promise<{ items?: unknown[] }> {
+  return tidalApi(`/v1/playlists/${uuid}/tracks`, { limit });
 }

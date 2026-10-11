@@ -132,10 +132,20 @@ function play(track, li) {
   if (track.source) params.set('source', track.source);
   if (track.title) params.set('title', track.title);
   if (track.artist) params.set('artist', track.artist);
+  if (track.duration) params.set('duration', String(track.duration));
 
   player.src = '/api/music/stream?' + params.toString();
   player.play().catch(() => {});
 }
+
+player.addEventListener('error', () => {
+  nowPlaying.textContent = 'Could not play this track. Check the server log.';
+});
+
+fetch('/api/music/source').then((r) => r.json()).then((s) => {
+  if (s.configured && !s.configured.ytm)
+    results.innerHTML = '<div class="status">Search works, but nothing will play until YTM_BASE is set. See .env.example.</div>';
+}).catch(() => {});
 
 document.getElementById('searchBtn').addEventListener('click', search);
 q.addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
